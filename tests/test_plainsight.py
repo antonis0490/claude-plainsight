@@ -100,6 +100,8 @@ class PlainsightTest(unittest.TestCase):
         self.assertEqual(overview["args"], [self.script, "overview"])
         self.assertNotIn("async", overview)
 
+        self.assertEqual(self.settings()["permissions"]["additionalDirectories"], [os.path.abspath(self.vault)])
+
         claude_md = self.read(os.path.join(self.config, "CLAUDE.md"))
         self.assertIn(plainsight.START, claude_md)
         self.assertIn(plainsight.END, claude_md)
@@ -167,9 +169,10 @@ class PlainsightTest(unittest.TestCase):
         self.sync(self.repo)
         self.sync(self.repo)
         self.assertEqual(self.read(os.path.join(self.proj, "app.md")), hub)
-        self.assertEqual(sorted(os.listdir(self.proj)), ["CLAUDE.md", "_health.md", "app.md", "memory"]
-                         if os.path.lexists(os.path.join(self.proj, "CLAUDE.md"))
-                         else ["_health.md", "app.md", "memory"])
+        expected = ["_health.md", "app.md", "memory", "notes"]
+        if os.path.lexists(os.path.join(self.proj, "CLAUDE.md")):
+            expected.insert(0, "CLAUDE.md")
+        self.assertEqual(sorted(os.listdir(self.proj)), expected)
 
     def assert_memory_link(self, name, memory_of):
         link = os.path.join(self.proj, name)
@@ -233,6 +236,116 @@ class PlainsightTest(unittest.TestCase):
         self.assertEqual(self.read(os.path.join(self.proj, "memory", "mine.md")), "mine\n")
         self.assertIn("not a link", self.read(os.path.join(self.proj, "_health.md")))
 
+    # install options and backfill
+
+    def test_install_dry_run_changes_nothing(self):
+        self.write(os.path.join(self.config, "settings.json"), '{"theme": "dark"}\n')
+        result = self.run_cli("install", "--dry-run", "--vault", self.vault, "--root", self.root, script=SOURCE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Dry run", result.stdout)
+        self.assertIn("+  \"hooks\"", result.stdout.replace("    +", "+"))
+        self.assertIn(plainsight.START, result.stdout)
+        self.assertEqual(self.read(os.path.join(self.config, "settings.json")), '{"theme": "dark"}\n')
+        self.assertFalse(os.path.exists(os.path.join(self.config, "CLAUDE.md")))
+        self.assertFalse(os.path.exists(self.vault))
+
+    def test_install_without_vault_access(self):
+        result = self.run_cli("install", "--no-vault-access", "--vault", self.vault, "--root", self.root,
+                              script=SOURCE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("permissions", self.settings())
+
+    def test_install_keeps_vault_access_the_user_added(self):
+        vault = os.path.abspath(self.vault)
+        self.write(os.path.join(self.config, "settings.json"),
+                   json.dumps({"permissions": {"additionalDirectories": [vault]}}))
+        self.install()
+        self.assertEqual(self.settings()["permissions"]["additionalDirectories"], [vault])
+        self.run_cli("uninstall")
+        self.assertEqual(self.settings()["permissions"]["additionalDirectories"], [vault])
+
+    def test_install_backfills_projects_with_memory(self):
+        real_repo = os.path.realpath(self.repo)
+        self.write(os.path.join(plainsight.memory_dir_for(real_repo), "MEMORY.md"), "")
+        os.makedirs(os.path.join(self.root, "untouched"))
+        self.install()
+        self.assertTrue(plainsight.same_path(plainsight.link_target(os.path.join(self.proj, "memory")),
+                                             plainsight.memory_dir_for(real_repo)))
+        self.assertEqual(os.listdir(os.path.join(self.vault, "projects")), ["app"])
+        self.assertIn("[[projects/app/app\\|app]]", self.read(os.path.join(self.vault, "Projects.md")))
+
+    def test_sync_all_links_nested_repos(self):
+        web = os.path.realpath(os.path.join(self.repo, "web"))
+        os.makedirs(os.path.join(web, ".git"))
+        os.makedirs(plainsight.memory_dir_for(web))
+        os.makedirs(os.path.join(self.repo, "node_modules", "pkg"))
+        self.install()
+        shutil.rmtree(os.path.join(self.vault, "projects"))
+        result = self.run_cli("sync", "--all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Linked 1 project(s): app", result.stdout)
+        self.assert_memory_link("memory-web", web)
+        self.assertFalse(os.path.lexists(os.path.join(self.proj, "memory")))
+
+    def test_demo_builds_sandbox_and_touches_nothing_else(self):
+        demo = os.path.join(self.tmp, "demo")
+        result = self.run_cli("demo", "--path", demo, script=SOURCE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(self.config), [])  # the real config dir is untouched
+        vault = os.path.join(demo, "vault")
+        self.assertEqual(len(os.listdir(os.path.join(vault, "projects"))), 3)
+        self.assertTrue(os.path.lexists(os.path.join(vault, "projects", "studio", "memory-site")))
+        self.assertIn("Inbox (notes the user left for you in Obsidian)", result.stdout)
+        self.assertIn("[[staging-env]]", self.read(os.path.join(vault, "projects", "harbor-api", "_health.md")))
+        result = self.run_cli("demo", "--path", demo, script=SOURCE)
+        self.assertEqual(result.returncode, 1)  # refuses to overwrite
+
+    # notes, inbox and dashboard
+
+    def test_session_context_shows_inbox_and_notes(self):
+        self.install()
+        self.sync(self.repo)
+        hub = os.path.join(self.proj, "app.md")
+        self.write(hub, self.read(hub).replace("## Inbox\n", "## Inbox\n- Prefer pnpm over npm.\n", 1))
+        self.write(os.path.join(self.proj, "notes", "api-ideas.md"), "Ideas.\n")
+        self.write(os.path.join(self.proj, "notes", "deep", "plan.md"), "Plan.\n")
+        out = self.overview(self.repo)
+        self.assertIn("Hub note: ", out)
+        self.assertNotIn("Project overview:", out)
+        self.assertIn("Inbox (notes the user left for you in Obsidian):\n- Prefer pnpm over npm.", out)
+        self.assertIn("- api-ideas.md", out)
+        self.assertIn("- deep/plan.md", out)
+        self.assertNotIn("Ideas.", out)  # names only, never contents
+
+    def test_notes_list_is_capped(self):
+        self.install()
+        self.sync(self.repo)
+        for i in range(plainsight.NOTES_LIST_CAP + 5):
+            self.write(os.path.join(self.proj, "notes", "n%02d.md" % i), "x\n")
+        out = self.overview(self.repo)
+        self.assertIn("...and 5 more", out)
+        self.assertEqual(out.count("\n- n"), plainsight.NOTES_LIST_CAP)
+
+    def test_dashboard(self):
+        self.install()
+        self.sync(self.repo)
+        self.set_overview("A shop front for bikes.\nMore detail.")
+        hub = os.path.join(self.proj, "app.md")
+        self.write(hub, self.read(hub).replace("## Inbox\n", "## Inbox\n- one\n- two\n", 1))
+        self.sync(self.repo)
+        dashboard = self.read(os.path.join(self.vault, "Projects.md"))
+        self.assertIn("| [[projects/app/app\\|app]] | A shop front for bikes. | 2 line(s) | "
+                      "[[projects/app/_health\\|ok]] |", dashboard)
+        self.assertNotIn("More detail", dashboard)
+
+    def test_lint_scans_notes(self):
+        self.install()
+        self.sync(self.repo)
+        self.write(os.path.join(self.proj, "notes", "keys.md"), "AKIAABCDEFGHIJKLMNOP\n[[nowhere]]\n")
+        result = self.run_cli("lint")
+        self.assertIn("notes/keys.md:1` looks like a credential (AWS access key)", result.stdout)
+        self.assertIn("notes/keys.md:2` broken link `[[nowhere]]`", result.stdout)
+
     # overview
 
     def test_overview_empty_prints_nothing(self):
@@ -259,8 +372,9 @@ class PlainsightTest(unittest.TestCase):
         self.sync(self.repo)
         self.set_overview("x" * 5000)
         out = self.overview(self.repo)
-        self.assertLessEqual(len(out.rstrip("\n")), 2000)
-        self.assertIn("truncated", out)
+        overview = out.split("Project overview:\n", 1)[1].rstrip("\n")
+        self.assertLessEqual(len(overview), 2000)
+        self.assertTrue(overview.endswith("[...truncated]"))
 
     def test_overview_outside_roots_prints_nothing(self):
         self.install()
@@ -321,13 +435,16 @@ class PlainsightTest(unittest.TestCase):
         memory = plainsight.memory_dir_for(self.repo)
         self.write(os.path.join(memory, "fact.md"), "A fact.\n")
         self.write(os.path.join(self.proj, "my-note.md"), "Mine.\n")
+        self.write(os.path.join(self.proj, "notes", "kept.md"), "Kept.\n")
 
         result = self.run_cli("uninstall")
         self.assertEqual(result.returncode, 0, result.stderr)
 
         self.assertEqual(self.settings(), {"hooks": {"SessionStart": [user_hook]}})
         self.assertEqual(self.read(os.path.join(self.config, "CLAUDE.md")), "# My rules\n")
-        self.assertEqual(sorted(os.listdir(self.proj)), ["app.md", "my-note.md"])
+        self.assertEqual(sorted(os.listdir(self.proj)), ["app.md", "my-note.md", "notes"])
+        self.assertEqual(self.read(os.path.join(self.proj, "notes", "kept.md")), "Kept.\n")
+        self.assertFalse(os.path.exists(os.path.join(self.vault, "Projects.md")))
         self.assertFalse(os.path.exists(os.path.join(self.vault, "shared")))
         self.assertFalse(os.path.exists(os.path.join(self.vault, ".plainsight")))
         self.assertEqual(self.read(os.path.join(memory, "fact.md")), "A fact.\n")
@@ -340,7 +457,7 @@ class PlainsightTest(unittest.TestCase):
         self.install()
         self.run_cli("uninstall")
         self.assertFalse(os.path.exists(os.path.join(self.config, "CLAUDE.md")))
-        self.assertNotIn("hooks", self.settings())
+        self.assertEqual(self.settings(), {})
 
     # doctor
 

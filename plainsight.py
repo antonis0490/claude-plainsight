@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """claude-plainsight: Claude Code's memory, in plain sight.
 
-Links each project's Claude Code memory into an Obsidian vault and shows a short
-per-project Overview to Claude at session start. Python 3 standard library only.
+Links each project's Claude Code memory into an Obsidian vault, and shows Claude a short
+per-project Overview, an Inbox of your notes and the names of your project notes at
+session start. Python 3 standard library only.
 
 Commands: install, sync, overview, lint, uninstall, doctor. Run with -h for help.
 """
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -16,15 +18,20 @@ import subprocess
 import sys
 from urllib.parse import unquote
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_VAULT = "~/ClaudeVault"
 HOME_DIR = ".plainsight"
 SCRIPT_NAME = "plainsight.py"
 HOOK_SUFFIX = "/" + HOME_DIR + "/" + SCRIPT_NAME
 START = "<!-- claude-plainsight:start -->"
 END = "<!-- claude-plainsight:end -->"
-OVERVIEW_CAP = 2000
+SECTION_CAP = 2000
+NOTES_LIST_CAP = 30
 HEALTH = "_health.md"
+NOTES = "notes"
+DASHBOARD = "Projects.md"
+SCAN_DEPTH = 3
+SKIP_SCAN = {"node_modules", "vendor", "dist", "build", "target", "venv", "__pycache__"}
 IS_WINDOWS = os.name == "nt"
 
 HUB_TEMPLATE = """# {repo}
@@ -32,16 +39,22 @@ HUB_TEMPLATE = """# {repo}
 ## Overview
 <!-- A short, current summary of this project, kept up to date by Claude.
      Shown to Claude at the start of every session in this project. -->
+
+## Inbox
+<!-- Quick notes for Claude. Shown in full at the next session start; Claude saves them
+     to memory or raises them with you, then clears them. For longer notes, add files
+     to the notes folder next to this note. -->
 """
 
 BLOCK_TEMPLATE = """{start}
-## Project overviews (claude-plainsight)
+## Project hub notes (claude-plainsight)
 
-Each project has a hub note at `{hub}` in an Obsidian vault. The `## Overview` section of that note is shown to you at the start of every session.
+Each project has a hub note at `{vault}/projects/<repo>/<repo>.md` in an Obsidian vault. At session start you are shown its Overview, its Inbox, and the names of the user's notes for the project.
 
-- Keep the Overview short: a few lines, well under 2000 characters. Say what the project is, where it stands, and what matters next.
-- When something it states changes, update it in the same session. Edit only the Overview section and leave the rest of the note alone.
-- Put details in memory files, not in the Overview.
+- **Overview:** keep it short, a few lines and well under 2000 characters: what the project is, where it stands, what matters next. When something it says changes, update it in the same session.
+- **Inbox:** notes the user left for you. Save facts and preferences to memory. Mention requests to the user, and act on them only when asked or when they fit the current task. Then delete what you handled from the Inbox and leave the rest.
+- **notes/ folder:** the user's own notes. Read them when relevant; do not edit them unless asked.
+- Edit only the Overview and Inbox sections of a hub note. Put details in memory files.
 {end}"""
 
 WIKILINK = re.compile(r"!?\[\[([^\[\]\n]+?)\]\]")
@@ -477,6 +490,7 @@ def project_dirs(vault):
 def health_text(repo, problems, notices):
     lines = ["# Health: %s" % repo, "",
              "Written by claude-plainsight on every session start. Edits here are overwritten.", "",
+             "Problems: %d" % len(problems), "",
              "## Lint", ""]
     lines += ["- " + p for p in problems] or ["- No problems found."]
     if notices:
@@ -484,7 +498,296 @@ def health_text(repo, problems, notices):
     return "\n".join(lines) + "\n"
 
 
+def write_if_changed(path, text):
+    if read_text(path) != text:
+        write_text(path, text)
+
+
+# ---------- hub note sections and notes ----------
+
+def read_section(text, title, cap=SECTION_CAP):
+    """A level 2 section of a note, HTML comments removed, capped at cap characters."""
+    m = re.search(r"^##[ \t]+%s[ \t]*$(.*?)(?=^#{1,2}[ \t]|\Z)" % re.escape(title), text, re.M | re.S)
+    if not m:
+        return ""
+    body = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S).strip()
+    if len(body) > cap:
+        body = body[:cap - 15].rstrip() + "\n[...truncated]"
+    return body
+
+
+def list_notes(proj):
+    """The user's notes in the project's notes folder, newest first."""
+    folder = os.path.join(proj, NOTES)
+    if not os.path.isdir(folder):
+        return []
+    notes = [p for p in walk_files(folder) if p.lower().endswith(".md")]
+    notes.sort(key=lambda p: (-os.path.getmtime(p), p))
+    return [rel_to(p, folder) for p in notes]
+
+
+def session_context(vault, repo):
+    """What Claude sees at session start: Overview, Inbox and note names. Empty when there is nothing."""
+    proj = os.path.join(vault, "projects", repo)
+    hub = os.path.join(proj, repo + ".md")
+    text = read_text(hub) or ""
+    parts = []
+    overview = read_section(text, "Overview")
+    if overview:
+        parts.append("Project overview:\n" + overview)
+    inbox = read_section(text, "Inbox")
+    if inbox:
+        parts.append("Inbox (notes the user left for you in Obsidian):\n" + inbox)
+    notes = list_notes(proj)
+    if notes:
+        shown = ["- " + n for n in notes[:NOTES_LIST_CAP]]
+        if len(notes) > NOTES_LIST_CAP:
+            shown.append("- ...and %d more" % (len(notes) - NOTES_LIST_CAP))
+        parts.append("The user's notes for this project, in %s (read them when relevant):\n%s"
+                     % (os.path.join(proj, NOTES), "\n".join(shown)))
+    if not parts:
+        return ""
+    return "[claude-plainsight] Hub note: %s\n\n%s" % (hub, "\n\n".join(parts))
+
+
+def dashboard_text(vault):
+    rows = []
+    for proj in project_dirs(vault):
+        repo = os.path.basename(proj)
+        text = read_text(os.path.join(proj, repo + ".md")) or ""
+        overview = read_section(text, "Overview").split("\n", 1)[0].strip()
+        if len(overview) > 100:
+            overview = overview[:97].rstrip() + "..."
+        inbox = len([l for l in read_section(text, "Inbox").splitlines() if l.strip()])
+        m = re.search(r"^Problems: (\d+)", read_text(os.path.join(proj, HEALTH)) or "", re.M)
+        health = "not checked" if m is None else ("ok" if m.group(1) == "0" else "%s problem(s)" % m.group(1))
+        rows.append("| [[projects/%s/%s\\|%s]] | %s | %s | [[projects/%s/%s\\|%s]] |" % (
+            repo, repo, repo, overview.replace("|", "\\|") or "_empty_",
+            "%d line(s)" % inbox if inbox else "", repo, HEALTH[:-3], health))
+    lines = ["# Projects", "",
+             "Written by claude-plainsight on every session start. Edits here are overwritten.", ""]
+    if rows:
+        lines += ["| Project | Overview | Inbox | Health |", "| --- | --- | --- | --- |"] + rows
+    else:
+        lines.append("No projects yet. They appear after their first Claude Code session.")
+    return "\n".join(lines) + "\n"
+
+
+# ---------- linking projects ----------
+
+def memory_link_name(project_dir, mroot):
+    # A nested repo inside a plain project folder gets its own memory-<subdir> link.
+    try:
+        rel = os.path.relpath(os.path.realpath(mroot), project_dir)
+    except ValueError:
+        return "memory"
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return "memory"
+    return "memory-" + rel.replace(os.sep, "-")
+
+
+def link_project(vault, project_dir, mroots, notices):
+    """Link memory folders and CLAUDE.md files for one project; create its hub note once."""
+    repo = os.path.basename(project_dir)
+    proj = os.path.join(vault, "projects", repo)
+    os.makedirs(os.path.join(proj, NOTES), exist_ok=True)
+    for mroot in mroots:
+        mem = memory_dir_for(mroot)
+        os.makedirs(mem, exist_ok=True)
+        ensure_link(mem, os.path.join(proj, memory_link_name(project_dir, mroot)), True, notices)
+
+    project_md = os.path.join(project_dir, "CLAUDE.md")
+    if os.path.isfile(project_md):
+        ensure_link(project_md, os.path.join(proj, "CLAUDE.md"), False, notices)
+    user_md = os.path.join(claude_dir(), "CLAUDE.md")
+    if os.path.isfile(user_md):
+        os.makedirs(os.path.join(vault, "shared"), exist_ok=True)
+        ensure_link(user_md, os.path.join(vault, "shared", "CLAUDE.md"), False, notices)
+
+    hub = os.path.join(proj, repo + ".md")
+    if not os.path.lexists(hub):
+        write_text(hub, HUB_TEMPLATE.format(repo=repo))
+    return proj
+
+
+def known_memory_roots(project_dir):
+    """Folders in a project that already have Claude Code memory, a few levels deep."""
+    found = []
+    depth = project_dir.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, _ in os.walk(project_dir):
+        if os.path.isdir(memory_dir_for(dirpath)) and memory_root(dirpath) == dirpath:
+            found.append(dirpath)
+        if dirpath.count(os.sep) - depth >= SCAN_DEPTH:
+            dirnames[:] = []
+        else:
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_SCAN)
+    return found
+
+
+def sync_all(vault, roots):
+    """Link every project under the roots that Claude Code has memory for. Returns (proj, notices) pairs."""
+    results = []
+    for root in roots:
+        root = os.path.realpath(expand(root))
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            project_dir = os.path.join(root, name)
+            if name.startswith(".") or not os.path.isdir(project_dir):
+                continue
+            mroots = known_memory_roots(project_dir)
+            if mroots:
+                notices = []
+                results.append((link_project(vault, project_dir, mroots, notices), notices))
+    return results
+
+
+def write_reports(vault, results):
+    """Lint the synced projects into their _health.md, then refresh the dashboard."""
+    index = vault_index(vault)
+    for proj, notices in results:
+        repo = os.path.basename(proj)
+        write_if_changed(os.path.join(proj, HEALTH), health_text(repo, lint_project(proj, index), notices))
+        for notice in notices:
+            print("claude-plainsight: " + notice, file=sys.stderr)
+    write_if_changed(os.path.join(vault, DASHBOARD), dashboard_text(vault))
+
+
+# ---------- demo ----------
+
+def memory_note(name, description, kind, body):
+    return "---\nname: %s\ndescription: %s\nmetadata:\n  type: %s\n---\n\n%s\n" % (name, description, kind, body)
+
+
+# Fictional sample projects. Each "repo" is the folder Claude Code keys memory on.
+DEMO_PROJECTS = [
+    {
+        "name": "harbor-api",
+        "repo": "",
+        "claude_md": "# harbor-api\n\n- Run `make test` before committing.\n- Python 3.12, FastAPI, SQLAlchemy 2.\n",
+        "overview": "REST API for booking boat slips at small marinas. FastAPI and Postgres on Fly.io.\n"
+                    "State: v1 is live at two marinas; payments sit behind a feature flag.\n"
+                    "Next: Stripe payouts, then the waiting list endpoint.",
+        "inbox": "- The Kalamaki marina wants SMS reminders, not email. Check whether Twilio fits the budget.\n"
+                 "- I prefer one migration per PR.",
+        "memory": {
+            "MEMORY.md": "- [Deploy process](deploy-process.md) - how releases reach Fly.io\n"
+                         "- [Database migrations](db-migrations.md) - Alembic rules\n"
+                         "- [Small PRs](small-prs.md) - review preference\n",
+            "deploy-process.md": memory_note(
+                "deploy-process", "How releases reach Fly.io", "project",
+                "Releases deploy from `main` through GitHub Actions to Fly.io, staging first.\n"
+                "Read [[db-migrations]] before any schema change. Staging details: [[staging-env]]."),
+            "db-migrations.md": memory_note(
+                "db-migrations", "Alembic rules", "project",
+                "Never edit a migration that has shipped; add a new one.\n"
+                "CI runs `make migrate-check` on every PR."),
+            "small-prs.md": memory_note(
+                "small-prs", "Review preference: small PRs", "feedback",
+                "Keep PRs small, one concern each.\n\n**Why:** the user reviews on a phone.\n"
+                "**How to apply:** split refactors from features."),
+        },
+        "notes": {
+            "launch-checklist.md": "# Launch checklist\n\n- [x] Marina onboarding\n- [ ] Stripe payouts\n"
+                                   "- [ ] Waiting list\n- [ ] SMS reminders\n",
+            "meetings/2026-10-12 Kalamaki.md": "# Call with Kalamaki marina\n\nThey want SMS reminders and a weekly "
+                                               "occupancy report. Follow up on [[launch-checklist]].\n",
+        },
+    },
+    {
+        "name": "pixel-garden",
+        "repo": "",
+        "claude_md": "",
+        "overview": "Cozy mobile game about growing pixel-art plants. Expo and React Native.\n"
+                    "State: closed beta on TestFlight with 40 players.\n"
+                    "Next: cloud saves across devices.",
+        "inbox": "",
+        "memory": {
+            "MEMORY.md": "- [Art style](art-style.md) - palette and sprite rules\n"
+                         "- [Beta feedback](beta-feedback.md) - what testers ask for\n",
+            "art-style.md": memory_note(
+                "art-style", "Palette and sprite rules", "project",
+                "16x16 sprites, a 12-colour palette, no outlines. See [[beta-feedback]] for what players liked."),
+            "beta-feedback.md": memory_note(
+                "beta-feedback", "What beta testers ask for", "project",
+                "Top asks: cloud saves, a calmer night mode, fewer ads."),
+        },
+        "notes": {"roadmap.md": "# Roadmap\n\n1. Cloud saves\n2. Night mode\n3. Seasonal plants\n"},
+    },
+    {
+        "name": "studio",
+        "repo": "site",
+        "claude_md": "",
+        "overview": "Design studio website and client portal. The Astro site lives in `site/`, its own repo.\n"
+                    "Next: case study pages for three recent clients.",
+        "inbox": "",
+        "memory": {
+            "MEMORY.md": "- [Brand voice](brand-voice.md) - how the studio writes\n",
+            "brand-voice.md": memory_note("brand-voice", "How the studio writes", "project",
+                                          "Short sentences. No jargon. Show the work before talking about it."),
+            "old-pricing.md": memory_note("old-pricing", "Pricing before 2026", "project",
+                                          "Superseded by the 2026 rate card."),
+        },
+        "notes": {},
+    },
+]
+
+
+def fill_section(text, title, body):
+    if not body:
+        return text
+    marker = "## %s\n" % title
+    return text.replace(marker, marker + body + "\n", 1)
+
+
+def cmd_demo(args):
+    base = expand(args.path)
+    if os.path.exists(base) and os.listdir(base):
+        print("error: %s already exists and is not empty; pick another --path or delete it" % base, file=sys.stderr)
+        return 1
+    # Everything lives under base, including a stand-in Claude config, so the real one is never touched.
+    os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(base, "claude")
+    code = os.path.join(base, "code")
+    vault = os.path.join(base, "vault")
+    for p in DEMO_PROJECTS:
+        project_dir = os.path.join(code, p["name"])
+        repo = os.path.join(project_dir, *p["repo"].split("/")) if p["repo"] else project_dir
+        os.makedirs(os.path.join(repo, ".git"))
+        for name, text in p["memory"].items():
+            write_text(os.path.join(memory_dir_for(os.path.realpath(repo)), name), text)
+        if p["claude_md"]:
+            write_text(os.path.join(project_dir, "CLAUDE.md"), p["claude_md"])
+
+    results = sync_all(vault, [code])
+    for p in DEMO_PROJECTS:
+        proj = os.path.join(vault, "projects", p["name"])
+        hub = os.path.join(proj, p["name"] + ".md")
+        write_text(hub, fill_section(fill_section(read_text(hub), "Overview", p["overview"]), "Inbox", p["inbox"]))
+        for name, text in p["notes"].items():
+            write_text(os.path.join(proj, NOTES, *name.split("/")), text)
+    write_reports(vault, results)
+
+    print("Demo ready at %s" % base)
+    print("  vault:  %s  (open this folder in Obsidian; start with %s)" % (vault, DASHBOARD))
+    print("  sample: %s, with a stand-in Claude config in %s" % (code, os.path.join(base, "claude")))
+    print("See what Claude would get at session start in harbor-api:")
+    print("")
+    print(session_context(vault, "harbor-api"))
+    print("")
+    print("Your real Claude Code setup was not touched. Delete %s when you are done." % base)
+    return 0
+
+
 # ---------- commands ----------
+
+def show_diff(path, old, new):
+    if old == new:
+        print("unchanged: %s" % path)
+        return
+    print("would change: %s" % path)
+    diff = difflib.unified_diff(old.splitlines(True), new.splitlines(True), path, path + " (after install)")
+    sys.stdout.write("".join("    " + line if line.endswith("\n") else "    " + line + "\n" for line in diff))
+
 
 def cmd_install(args):
     vault = expand(args.vault)
@@ -502,32 +805,78 @@ def cmd_install(args):
     except ValueError as e:
         print("error: %s is not valid JSON (%s); fix it and run install again" % (settings_file, e), file=sys.stderr)
         return 1
+    old_settings = json.dumps(settings, indent=2) + "\n" if os.path.exists(settings_file) else ""
 
     home = os.path.join(vault, HOME_DIR)
     script = os.path.join(home, SCRIPT_NAME)
+    old_cfg = load_config(vault) or {}
+
+    strip_our_hooks(settings)
+    settings.setdefault("hooks", {}).setdefault("SessionStart", []).append({"hooks": our_hooks(script)})
+    # Let Claude read and edit the vault without a permission prompt for every Overview update.
+    dirs = settings.get("permissions", {}).get("additionalDirectories", [])
+    present = any(same_path(d, vault) for d in dirs if isinstance(d, str))
+    vault_access = bool(old_cfg.get("vault_access"))
+    if args.no_vault_access:
+        if vault_access:
+            remove_vault_access(settings, vault)
+        vault_access = False
+    elif not present:
+        settings.setdefault("permissions", {}).setdefault("additionalDirectories", []).append(vault)
+        vault_access = True
+    new_settings = json.dumps(settings, indent=2) + "\n"
+
+    claude_md = os.path.join(claude_dir(), "CLAUDE.md")
+    old_md = read_text(claude_md) or ""
+    new_md = set_block(old_md, BLOCK_TEMPLATE.format(start=START, end=END, vault=vault))
+
+    if args.dry_run:
+        print("Dry run: nothing has been changed.\n")
+        show_diff(settings_file, old_settings, new_settings)
+        show_diff(claude_md, old_md, new_md)
+        print("would write: %s" % script)
+        print("would write: %s (roots: %s)" % (os.path.join(home, "config.json"), ", ".join(roots)))
+        print("would link: every project under the roots that Claude Code already has memory for")
+        return 0
+
     os.makedirs(home, exist_ok=True)
     os.makedirs(os.path.join(vault, "projects"), exist_ok=True)
     if not same_path(os.path.abspath(__file__), script):
         shutil.copyfile(os.path.abspath(__file__), script)
-    write_json(os.path.join(home, "config.json"), {"vault": vault, "roots": roots})
+    write_json(os.path.join(home, "config.json"), {"vault": vault, "roots": roots, "vault_access": vault_access})
+    write_text(settings_file, new_settings)
+    write_text(claude_md, new_md)
 
-    strip_our_hooks(settings)
-    hooks = settings.setdefault("hooks", {})
-    hooks.setdefault("SessionStart", []).append({"hooks": our_hooks(script)})
-    write_json(settings_file, settings)
-
-    claude_md = os.path.join(claude_dir(), "CLAUDE.md")
-    hub = os.path.join(vault, "projects", "<repo>", "<repo>.md")
-    block = BLOCK_TEMPLATE.format(start=START, end=END, hub=hub)
-    write_text(claude_md, set_block(read_text(claude_md) or "", block))
+    results = sync_all(vault, roots)
+    write_reports(vault, results)
 
     print("Installed claude-plainsight %s" % VERSION)
     print("  vault:    %s" % vault)
     print("  roots:    %s" % ", ".join(roots))
     print("  hooks:    %s (SessionStart: sync, overview)" % settings_file)
+    if vault_access:
+        print("  access:   vault added to permissions.additionalDirectories")
     print("  CLAUDE.md block: %s" % claude_md)
-    print("Open the vault folder in Obsidian. Projects appear after their next Claude Code session.")
+    print("  linked:   %d project(s) with existing memory" % len(results))
+    print("Open %s in Obsidian and start with %s." % (vault, DASHBOARD))
     return 0
+
+
+def remove_vault_access(settings, vault):
+    perms = settings.get("permissions")
+    if not isinstance(perms, dict) or not isinstance(perms.get("additionalDirectories"), list):
+        return False
+    dirs = perms["additionalDirectories"]
+    kept = [d for d in dirs if not (isinstance(d, str) and same_path(d, vault))]
+    if len(kept) == len(dirs):
+        return False
+    if kept:
+        perms["additionalDirectories"] = kept
+    else:
+        del perms["additionalDirectories"]
+        if not perms:
+            del settings["permissions"]
+    return True
 
 
 def cmd_sync(args):
@@ -536,58 +885,21 @@ def cmd_sync(args):
     if cfg is None:
         print("claude-plainsight: no config in %s; run install" % vault, file=sys.stderr)
         return 1
+    if args.all:
+        results = sync_all(vault, cfg["roots"])
+        write_reports(vault, results)
+        names = [os.path.basename(proj) for proj, _ in results]
+        print("Linked %d project(s)%s" % (len(names), ": " + ", ".join(names) if names else ""))
+        return 0
     session = session_dir(read_hook_input())
     found = locate(session, cfg["roots"])
     if found is None:
         return 0
     root, repo, _ = found
-    proj = os.path.join(vault, "projects", repo)
-    os.makedirs(proj, exist_ok=True)
     notices = []
-
-    # A nested repo inside a plain project folder gets its own memory-<subdir> link.
-    mroot = memory_root(session)
-    mem = memory_dir_for(mroot)
-    os.makedirs(mem, exist_ok=True)
-    try:
-        rel = os.path.relpath(os.path.realpath(mroot), os.path.join(root, repo))
-    except ValueError:
-        rel = os.curdir
-    name = "memory" if rel == os.curdir or rel.startswith(os.pardir) else "memory-" + rel.replace(os.sep, "-")
-    ensure_link(mem, os.path.join(proj, name), True, notices)
-
-    project_md = os.path.join(root, repo, "CLAUDE.md")
-    if os.path.isfile(project_md):
-        ensure_link(project_md, os.path.join(proj, "CLAUDE.md"), False, notices)
-    user_md = os.path.join(claude_dir(), "CLAUDE.md")
-    if os.path.isfile(user_md):
-        os.makedirs(os.path.join(vault, "shared"), exist_ok=True)
-        ensure_link(user_md, os.path.join(vault, "shared", "CLAUDE.md"), False, notices)
-
-    hub = os.path.join(proj, repo + ".md")
-    if not os.path.lexists(hub):
-        write_text(hub, HUB_TEMPLATE.format(repo=repo))
-
-    report = health_text(repo, lint_project(proj, vault_index(vault)), notices)
-    health = os.path.join(proj, HEALTH)
-    if read_text(health) != report:
-        write_text(health, report)
-    for notice in notices:
-        print("claude-plainsight: " + notice, file=sys.stderr)
+    proj = link_project(vault, os.path.join(root, repo), [memory_root(session)], notices)
+    write_reports(vault, [(proj, notices)])
     return 0
-
-
-def read_overview(hub):
-    text = read_text(hub)
-    if text is None:
-        return ""
-    m = re.search(r"^##[ \t]+Overview[ \t]*$(.*?)(?=^#{1,2}[ \t]|\Z)", text, re.M | re.S)
-    if not m:
-        return ""
-    body = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S).strip()
-    if len(body) > OVERVIEW_CAP:
-        body = body[:OVERVIEW_CAP - 15].rstrip() + "\n[...truncated]"
-    return body
 
 
 def cmd_overview(args):
@@ -598,10 +910,9 @@ def cmd_overview(args):
         found = locate(session_dir(read_hook_input()), cfg["roots"]) if cfg else None
         if found is None:
             return 0
-        repo = found[1]
-        body = read_overview(os.path.join(vault, "projects", repo, repo + ".md"))
-        if body:
-            sys.stdout.buffer.write((body + "\n").encode("utf-8"))
+        text = session_context(vault, found[1])
+        if text:
+            sys.stdout.buffer.write((text + "\n").encode("utf-8"))
             sys.stdout.flush()
     except Exception:
         pass
@@ -632,15 +943,18 @@ def cmd_lint(args):
 
 def cmd_uninstall(args):
     vault = vault_path(args.vault)
+    cfg = load_config(vault) or {}
     settings_file = settings_path()
     try:
         settings = load_json(settings_file)
     except ValueError as e:
         print("error: %s is not valid JSON (%s); fix it and run uninstall again" % (settings_file, e), file=sys.stderr)
         return 1
-    if strip_our_hooks(settings):
+    removed_hooks = strip_our_hooks(settings)
+    removed_access = cfg.get("vault_access") and remove_vault_access(settings, vault)
+    if removed_hooks or removed_access:
         write_json(settings_file, settings)
-        print("Removed hooks from %s" % settings_file)
+        print("Removed hooks%s from %s" % (" and vault access" if removed_access else "", settings_file))
 
     claude_md = os.path.join(claude_dir(), "CLAUDE.md")
     text = read_text(claude_md)
@@ -653,7 +967,7 @@ def cmd_uninstall(args):
                 os.remove(claude_md)
             print("Removed the claude-plainsight block from %s" % claude_md)
 
-    # Remove only links and our generated files; hub notes and anything else stay.
+    # Remove only links and generated files; hub notes and anything you wrote stay.
     removed = 0
     for folder in project_dirs(vault) + [os.path.join(vault, "shared")]:
         if not os.path.isdir(folder) or link_target(folder) is not None:
@@ -665,8 +979,13 @@ def cmd_uninstall(args):
                 removed += 1
             elif entry == HEALTH and os.path.isfile(path):
                 os.remove(path)
+            elif entry == NOTES and os.path.isdir(path) and not os.listdir(path):
+                os.rmdir(path)
         if not os.listdir(folder):
             os.rmdir(folder)
+    for path in [os.path.join(vault, DASHBOARD)]:
+        if os.path.isfile(path):
+            os.remove(path)
     projects = os.path.join(vault, "projects")
     if os.path.isdir(projects) and not os.listdir(projects):
         os.rmdir(projects)
@@ -723,6 +1042,11 @@ def cmd_doctor(args):
             problems.append("%s hook points to %s, expected %s; run install again" % (sub, path, script))
         if sub == "sync" and hook.get("async") is not True:
             problems.append("sync hook is not async, so it slows session start")
+    if cfg and cfg.get("vault_access"):
+        dirs = (settings.get("permissions") or {}).get("additionalDirectories") or []
+        if not any(isinstance(d, str) and same_path(d, vault) for d in dirs):
+            problems.append("vault missing from permissions.additionalDirectories, so Claude will ask before "
+                            "editing hub notes; run install again")
 
     if find_block((read_text(os.path.join(claude_dir(), "CLAUDE.md")) or "").splitlines()) is None:
         problems.append("claude-plainsight block missing from %s; run install" % os.path.join(claude_dir(), "CLAUDE.md"))
@@ -757,14 +1081,21 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", metavar="command")
     sub.required = True
 
-    p = sub.add_parser("install", help="install hooks, CLAUDE.md block and config")
+    p = sub.add_parser("install", help="install hooks, CLAUDE.md block and config, then link existing projects")
     p.add_argument("--vault", default=DEFAULT_VAULT, help="Obsidian vault folder (default %s)" % DEFAULT_VAULT)
     p.add_argument("--root", action="append", required=True, help="folder holding your projects (repeatable)")
+    p.add_argument("--dry-run", action="store_true", help="show what would change and touch nothing")
+    p.add_argument("--no-vault-access", action="store_true",
+                   help="do not add the vault to permissions.additionalDirectories")
     p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("demo", help="build a sandbox vault with sample projects; touches nothing else")
+    p.add_argument("--path", default="plainsight-demo", help="folder to create (default ./plainsight-demo)")
+    p.set_defaults(func=cmd_demo)
 
     for name, func, text in [
         ("sync", cmd_sync, "link this session's project into the vault (SessionStart hook)"),
-        ("overview", cmd_overview, "print this project's Overview (SessionStart hook)"),
+        ("overview", cmd_overview, "print this project's Overview, Inbox and note names (SessionStart hook)"),
         ("lint", cmd_lint, "report broken links, unindexed notes and credentials (read only)"),
         ("uninstall", cmd_uninstall, "remove hooks, CLAUDE.md block and links; keep notes"),
         ("doctor", cmd_doctor, "check hooks, links and config"),
@@ -773,6 +1104,9 @@ def main(argv=None):
         p.add_argument("--vault", help="vault folder (default: where this script is installed, else %s)" % DEFAULT_VAULT)
         if name == "lint":
             p.add_argument("--project", help="only this project folder name")
+        if name == "sync":
+            p.add_argument("--all", action="store_true",
+                           help="link every project under the roots that Claude Code has memory for")
         p.set_defaults(func=func)
 
     args = parser.parse_args(argv)
