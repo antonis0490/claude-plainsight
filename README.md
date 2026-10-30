@@ -33,6 +33,12 @@ One Python file. Standard library only. Nothing to `pip install`.
 - **Near zero token cost.** Only the Overview, the Inbox and a list of note names enter Claude's context, each capped. An empty project adds nothing.
 - **Safe to try, easy to remove.** A sandbox demo, a `--dry-run` install that shows the exact diff, and an uninstall that leaves your notes alone.
 
+## Requirements
+
+- **[Claude Code](https://docs.claude.com/en/docs/claude-code/overview)**
+- **Python 3.8 or newer.** Already there on macOS and most Linux; on Windows, get it from [python.org](https://www.python.org/downloads/).
+- **[Obsidian](https://obsidian.md/download)** for browsing (Windows, macOS, Linux; free for any use). Install it yourself: claude-plainsight doesn't install apps. Strictly speaking it's optional, since the vault is plain Markdown and the Overview, Inbox and notes reach Claude either way.
+
 ## Quick start
 
 **1. Try the sandbox first.** It builds a vault with sample projects and touches nothing else on your machine.
@@ -179,6 +185,15 @@ It's told to edit only the Overview and Inbox sections of hub notes, and to leav
 <summary><b>What does it look for when it flags credentials?</b></summary>
 
 Common key formats (Anthropic and OpenAI style `sk-` keys, AWS, GitHub, Slack, Google, Stripe, private key blocks, JWTs) and assignments like `api_key = ...`. Text in `<angle brackets>` is treated as a placeholder and ignored. Reports show only the first four characters.
+</details>
+
+<details>
+<summary><b>Does Obsidian handle the linked folders well?</b></summary>
+
+Obsidian supports folder links that point outside the vault, but its [help page](https://obsidian.md/help/Files+and+folders/Symbolic+links+and+junctions) calls them "use at your own risk" and recommends backups. claude-plainsight stays inside its rules: every folder link points outside the vault, and no two links share a target (a worktree next to its main repo is reported in `_health.md` instead of being linked twice). Two things to know:
+
+- The `CLAUDE.md` links are file links, which Obsidian says "may work" but doesn't officially support. If Claude edits a `CLAUDE.md` while Obsidian is open, Obsidian may show the old text until you reopen the note.
+- Sync tools (Obsidian Sync, Git and others) may not follow links. Back up Claude's memory from `~/.claude`, not from the vault.
 </details>
 
 <details>

@@ -18,7 +18,7 @@ import subprocess
 import sys
 from urllib.parse import unquote
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_VAULT = "~/ClaudeVault"
 HOME_DIR = ".plainsight"
 SCRIPT_NAME = "plainsight.py"
@@ -576,13 +576,18 @@ def dashboard_text(vault):
 # ---------- linking projects ----------
 
 def memory_link_name(project_dir, mroot):
-    # A nested repo inside a plain project folder gets its own memory-<subdir> link.
+    """Link name for a memory root, or None when the root lies outside the project.
+
+    A nested repo inside a plain project folder gets its own memory-<subdir> link.
+    """
     try:
         rel = os.path.relpath(os.path.realpath(mroot), project_dir)
-    except ValueError:
+    except ValueError:  # another drive on Windows
+        return None
+    if rel == os.curdir:
         return "memory"
-    if rel == os.curdir or rel.startswith(os.pardir):
-        return "memory"
+    if rel.startswith(os.pardir):
+        return None
     return "memory-" + rel.replace(os.sep, "-")
 
 
@@ -592,9 +597,15 @@ def link_project(vault, project_dir, mroots, notices):
     proj = os.path.join(vault, "projects", repo)
     os.makedirs(os.path.join(proj, NOTES), exist_ok=True)
     for mroot in mroots:
+        name = memory_link_name(project_dir, mroot)
+        if name is None:
+            # A worktree beside its main repo, say. Obsidian ignores a second link to the same folder.
+            notices.append("this project uses the memory of `%s`, which is outside it; not linked here, "
+                           "since Obsidian ignores two links to the same folder" % mroot)
+            continue
         mem = memory_dir_for(mroot)
         os.makedirs(mem, exist_ok=True)
-        ensure_link(mem, os.path.join(proj, memory_link_name(project_dir, mroot)), True, notices)
+        ensure_link(mem, os.path.join(proj, name), True, notices)
 
     project_md = os.path.join(project_dir, "CLAUDE.md")
     if os.path.isfile(project_md):

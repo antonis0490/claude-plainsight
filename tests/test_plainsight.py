@@ -207,7 +207,11 @@ class PlainsightTest(unittest.TestCase):
         self.write(os.path.join(worktree, ".git"), "gitdir: %s\n" % gitdir)
         self.install()
         self.sync(worktree)
-        self.proj = os.path.join(self.vault, "projects", "app-wt")
+        # The worktree shares the main repo's memory, which must be linked only once (in the app project).
+        wt_proj = os.path.join(self.vault, "projects", "app-wt")
+        self.assertFalse(os.path.lexists(os.path.join(wt_proj, "memory")))
+        self.assertIn("uses the memory of", self.read(os.path.join(wt_proj, "_health.md")))
+        self.sync(self.repo)
         self.assert_memory_link("memory", self.repo)
 
     def test_sync_falls_back_to_project_dir_env(self):
